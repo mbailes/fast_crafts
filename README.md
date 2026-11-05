@@ -143,3 +143,19 @@ python3 tools/fix_pointing_v3.py           /aphid/temp/fast_crafts/data/ZD2021_1
 `/fred/oz002/users/vmandaog/pulsar_search/FAST/crafts_2bit_miaocc01`. Needs numpy + astropy.
 
 Batch: `slurm/fix_pointing_v3.slurm` runs one array task per epoch from a list (instructions in its header).
+
+### `tools/fil_pairsum.py` — sum time-sample pairs before `rfifind` (removes the cal)
+
+The noise-diode cal in the CRAFTS 2-bit filterbanks toggles every sample (it is mistimed), so every
+channel carries a strong tone at half the sampling rate (5086 Hz at 98.304 us). `rfifind` then flags
+every channel and interval and zaps essentially the whole band: **1022/1024 channels** on a test beam.
+Summing adjacent samples puts cal-on + cal-off in every output sample; the same `rfifind` then zaps
+**382/1024** (236 of them the fixed `-zapchan` list).
+
+Two 2-bit values sum to 0..6, which fits in 4 bits exactly, so the output is **lossless and the same
+size** as the input: half the samples (196.608 us), 4 bits each. Checked: PRESTO `prepdata` gives
+bit-identical dedispersed series from the 4-bit file and an 8-bit version of the same sums.
+
+```
+python3 tools/fil_pairsum.py --outdir OUTDIR  *.fil       # -> OUTDIR/<name>_x2.fil, ~2 s per 600 MB beam
+```
