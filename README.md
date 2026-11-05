@@ -25,7 +25,14 @@ python3 tools/crafts_audit.py /aphid/temp/fast_crafts/data -o audit.txt --tsv au
 cat audit.txt
 ```
 
-Reports:
+Runs in two phases, with live feedback on stderr:
+
+1. **Directory listing** (fast): lists chunks, pointings and dates only and prints a directory summary straight away (pointings, epochs and date span per chunk).
+2. **Epoch census** (slow): one progress line per epoch, with running totals, files/s, an ETA and any flags (`!!`).
+
+The report gives start/finish times, the time for each phase and the total.
+
+Report contents:
 
 - totals: chunks, pointings, epochs, `.fits` files, TB
 - per chunk: pointings, epochs, files, size
@@ -33,4 +40,5 @@ Reports:
 - flags: missing beams, uneven files per beam, sequence gaps/duplicates, zero-size files, unrecognised names, `.fits` at the wrong depth, empty chunks/pointings
 
 Options: `--no-size` skips the per-file `stat` (faster, but no TB or permissions); `--expect-beams N` (default 19).
-Progress goes to stderr, the report to stdout (and `-o`).
+Progress goes to stderr, the report to stdout (and `-o`). To keep a progress log too:
+`python3 tools/crafts_audit.py /aphid/temp/fast_crafts/data -o audit.txt --tsv audit_epochs.tsv 2> audit_progress.log`

@@ -37,6 +37,13 @@ def human(nbytes):
     return f"{nbytes} B"
 
 
+def fmt_dur(sec):
+    sec = int(round(sec))
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}h{m:02d}m{s:02d}s" if h else (f"{m}m{s:02d}s" if m else f"{s}s")
+
+
 def subdirs_and_files(path, problems):
     """One scandir of path -> (sorted subdir names, list of DirEntry files)."""
     dirs, files = [], []
@@ -149,15 +156,23 @@ def main():
 
     root = os.path.abspath(args.root)
     want_size = not args.no_size
-    t0 = time.time()
     problems = []
     epochs = []          # (chunk, pointing, date, ep)
     misplaced = Counter()  # fits files at the wrong depth, by level name
+    t_start = time.time()
+    started = time.strftime('%Y-%m-%d %H:%M:%S')
 
+    def say(msg):
+        print(f"[{fmt_dur(time.time() - t_start):>8}] {msg}", file=sys.stderr, flush=True)
+
+    say(f"audit of {root} started {started}")
+
+    # ---- phase 1: directory skeleton only (fast: three levels of listings, no file stats) ----
+    say("phase 1: listing chunk / pointing / date directories ...")
     chunks, f0 = subdirs_and_files(root, problems)
     misplaced["root"] += sum(e.name.endswith(".fits") for e in f0)
-    for ci, chunk in enumerate(chunks, 1):
-        print(f"[{ci}/{len(chunks)}] {chunk}", file=sys.stderr, flush=True)
+    plan = []            # (chunk, pointing, date)
+    for chunk in chunks:
         cpath = os.path.join(root, chunk)
         pointings, f1 = subdirs_and_files(cpath, problems)
         misplaced["chunk"] += sum(e.name.endswith(".fits") for e in f1)
@@ -172,9 +187,45 @@ def main():
                 problems.append(f"FITS AT POINTING LEVEL ({nf2})  {ppath}")
             if not dates:
                 problems.append(f"NO DATE DIRS {ppath}")
-            for date in dates:
-                ep = audit_epoch(os.path.join(ppath, date), ptg, want_size, args.expect_beams, problems)
-                epochs.append((chunk, ptg, date, ep))
+            plan += [(chunk, ptg, d) for d in dates]
+    t_phase1 = time.time() - t_start
+
+    skel = defaultdict(lambda: defaultdict(list))   # chunk -> pointing -> [dates]
+    for c, p, d in plan:
+        skel[c][p].append(d)
+    tree = ["DIRECTORY SUMMARY  (from listings only)",
+            f"  {len(chunks)} chunks, {sum(len(v) for v in skel.values())} pointings, {len(plan)} epochs",
+            f"  {'chunk':<28} {'ptgs':>5} {'epochs':>6}  dates"]
+    for c in chunks:
+        ds = sorted(d for p in skel[c] for d in skel[c][p])
+        span = f"{ds[0]} .. {ds[-1]}" if ds else "-"
+        tree.append(f"  {c:<28} {len(skel[c]):>5} {len(ds):>6}  {span}")
+    sys.stderr.write("\n".join(tree) + "\n")
+    say(f"phase 1 done in {fmt_dur(t_phase1)}")
+
+    # ---- phase 2: census of every epoch, with running progress ----
+    say(f"phase 2: scanning {len(plan)} epochs" + ("" if want_size else " (--no-size: names only)") + " ...")
+    t2 = time.time()
+    run_files = run_bytes = 0
+    last_chunk = None
+    for i, (chunk, ptg, date) in enumerate(plan, 1):
+        if chunk != last_chunk:
+            say(f"chunk {chunks.index(chunk) + 1}/{len(chunks)}  {chunk}")
+            last_chunk = chunk
+        ep = audit_epoch(os.path.join(root, chunk, ptg, date), ptg, want_size, args.expect_beams, problems)
+        epochs.append((chunk, ptg, date, ep))
+        run_files += ep["nfits"]
+        run_bytes += ep["nbytes"]
+        el = time.time() - t2
+        eta = el / i * (len(plan) - i)
+        say(f"  {i:>5}/{len(plan)} {ptg}/{date}  {ep['nfits']:>5} files"
+            + (f" {human(ep['nbytes']):>10}" if want_size else "")
+            + f" | total {run_files} files" + (f" {human(run_bytes)}" if want_size else "")
+            + f", {run_files / el if el else 0:.0f} files/s, ETA {fmt_dur(eta)}"
+            + (f"  !! {' '.join(ep['flags'])}" if ep["flags"] else ""))
+    t_phase2 = time.time() - t2
+    t_total = time.time() - t_start
+    say(f"phase 2 done in {fmt_dur(t_phase2)}; audit finished in {fmt_dur(t_total)}")
 
     # ---------------- report ----------------
     L = []
@@ -182,26 +233,36 @@ def main():
     tot_files = sum(e["nfits"] for *_, e in epochs)
     tot_bytes = sum(e["nbytes"] for *_, e in epochs)
     n_ptg = len({(c, p) for c, p, _, _ in epochs})
-    w(f"CRAFTS data audit   {time.strftime('%Y-%m-%d %H:%M:%S')}   root={root}")
+    w(f"CRAFTS data audit   root={root}")
+    w(f"  started {started}   finished {time.strftime('%Y-%m-%d %H:%M:%S')}   host={os.uname().nodename}")
     w(f"  chunks     {len(chunks):8d}")
     w(f"  pointings  {n_ptg:8d}")
     w(f"  epochs     {len(epochs):8d}   (pointing/date dirs)")
     w(f"  .fits      {tot_files:8d}" + (f"   {human(tot_bytes)}" if want_size else ""))
     flagged = sum(bool(e["flags"]) for *_, e in epochs)
     w(f"  epochs flagged {flagged}   misplaced .fits {sum(misplaced.values())}   problems {len(problems)}")
-    w(f"  scan time {time.time() - t0:.1f} s")
+    w("")
+    w("TIMING")
+    w(f"  phase 1 (directory listing)  {fmt_dur(t_phase1):>10}")
+    w(f"  phase 2 (epoch census)       {fmt_dur(t_phase2):>10}"
+      + (f"   {tot_files / t_phase2:.0f} files/s" if t_phase2 > 0 else "")
+      + ("" if want_size else "   (--no-size)"))
+    w(f"  total                        {fmt_dur(t_total):>10}")
+    w("")
+    L += tree
     w("")
 
     # per chunk
     w("PER CHUNK")
-    w(f"  {'chunk':<28} {'ptgs':>5} {'epochs':>6} {'fits':>9} {'size':>11}")
+    w(f"  {'chunk':<28} {'ptgs':>5} {'epochs':>6} {'fits':>9} {'size':>11} {'flagged':>7}")
     bychunk = defaultdict(list)
     for c, p, d, e in epochs:
         bychunk[c].append((p, e))
     for c in chunks:
         rows = bychunk.get(c, [])
         w(f"  {c:<28} {len({p for p, _ in rows}):>5} {len(rows):>6} {sum(e['nfits'] for _, e in rows):>9}"
-          f" {human(sum(e['nbytes'] for _, e in rows)) if want_size else '-':>11}")
+          f" {human(sum(e['nbytes'] for _, e in rows)) if want_size else '-':>11}"
+          f" {sum(bool(e['flags']) for _, e in rows):>7}")
     w("")
 
     # per epoch
