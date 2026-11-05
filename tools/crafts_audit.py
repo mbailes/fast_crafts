@@ -21,6 +21,8 @@ skipped next time unless files were added/removed (or its header fix is mid-way)
 """
 
 import argparse
+import csv
+import glob
 import json
 import os
 import re
@@ -33,7 +35,10 @@ FITS_RE = re.compile(
     r'^(?P<ptg>.+?)_(?P<mode>[A-Za-z]+)-M(?P<beam>\d{2})_(?P<seq>\d+)(?:_(?P<tag>[^.]+))?\.fits$')
 
 TB = 1e12
-CACHE_VERSION = 1
+CACHE_VERSION = 2      # v2: per-file header stamp check added
+DEFAULT_POSDIR = "/fred/oz002/users/vmandaog/pulsar_search/FAST/crafts_2bit_miaocc01"
+# fix_pointing_v3 outcomes that a re-run will not change (need a human); others are retried
+PERMANENT_FAIL = {"SKIP_DT", "NOROOM", "NOCOL", "NOBEAM", "NOSTART", "NOPOS"}
 
 
 # ---------------------------------------------------------------------------
@@ -86,9 +91,11 @@ def save_cache(path, cache):
     os.replace(tmp, path)
 
 
-def cache_still_valid(d, dir_mtime_ns, want_size):
+def cache_still_valid(d, dir_mtime_ns, want_size, want_hdr=True):
     if d.get("dir_mtime_ns") != dir_mtime_ns:
         return False                  # files added/removed since: re-audit
+    if want_hdr and (not d.get("hdr_checked") or d["stamped"] < d["nfits"]):
+        return False                  # headers not all fixed yet: they change in place, so look again
     if want_size and not d.get("sized"):
         return False                  # cached by a --no-size run
     if want_size and d.get("hdrlog") and d["nfits"] - d["writable"] < d["nfits"]:
@@ -141,17 +148,50 @@ def compress_ranges(nums):
     return ",".join(out)
 
 
-def audit_epoch(path, pointing, want_size, expect_beams, problems):
+def header_stamp(path):
+    """Read only the primary header (2880-byte blocks to END). -> 'v3' (PNTFIX stamp), 'v2' (RA_DEG, no stamp), 'none'."""
+    found_v2 = False
+    with open(path, "rb") as f:
+        for _ in range(1000):
+            blk = f.read(2880)
+            if len(blk) < 2880:
+                raise ValueError("truncated primary header")
+            for i in range(0, 2880, 80):
+                k = blk[i:i + 8]
+                if k == b"PNTFIX  ":
+                    return "v3"
+                if k == b"RA_DEG  ":
+                    found_v2 = True
+                if k == b"END     ":
+                    return "v2" if found_v2 else "none"
+    raise ValueError("no END card")
+
+
+def audit_epoch(path, pointing, want_size, expect_beams, problems, want_hdr=False):
     """Census of one <pointing>/<date> directory full of .fits files."""
     dirs, files = subdirs_and_files(path, problems)
     ep = dict(nfits=0, nbytes=0, other_files=0, subdirs=dirs, beams=Counter(),
               seqs=defaultdict(list), zero=0, writable=0, badname=0,
-              ptg_mismatch=0, modes=Counter(), tags=Counter(), newest=0.0)
+              ptg_mismatch=0, modes=Counter(), tags=Counter(), newest=0.0,
+              hdr_checked=want_hdr, stamped=0, v2only=0, hdr_err=0, unstamped=[])
     for e in files:
         if not e.name.endswith(".fits"):
             ep["other_files"] += 1
             continue
         ep["nfits"] += 1
+        if want_hdr:
+            try:
+                h = header_stamp(e.path)
+            except (OSError, ValueError) as err:
+                h = "err"
+                ep["hdr_err"] += 1
+                if ep["hdr_err"] <= 3:
+                    problems.append(f"BAD HEADER  {e.path}: {err}")
+            if h == "v3":
+                ep["stamped"] += 1
+            else:
+                ep["v2only"] += h == "v2"
+                ep["unstamped"].append(e.name)
         if want_size:
             try:
                 st = e.stat(follow_symlinks=False)
@@ -228,10 +268,15 @@ def main():
                          "else next to ROOT)")
     ap.add_argument("--full", action="store_true", help="ignore the cache and re-scan every epoch")
     ap.add_argument("--no-cache", action="store_true", help="neither read nor write a cache")
+    ap.add_argument("--no-headers", action="store_true",
+                    help="do not read primary headers (no header-fix status)")
+    ap.add_argument("--posdir", default=os.environ.get("CRAFTS_POSDIR", DEFAULT_POSDIR),
+                    help="where <pointing>_<date>_pos.fits live (to tell NOPOS epochs)")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
     want_size = not args.no_size
+    want_hdr = not args.no_headers
     problems = []
     epochs = []          # (chunk, pointing, date, ep)
     misplaced = Counter()  # fits files at the wrong depth, by level name
@@ -304,7 +349,7 @@ def main():
             problems.append(f"UNREADABLE  {os.path.join(root, key)}: {err}")
             continue
         d = cache.get(key)
-        if d is not None and cache_still_valid(d, mt, want_size):
+        if d is not None and cache_still_valid(d, mt, want_size, want_hdr):
             ep = ep_from_json(d)
             problems.extend(ep.get("problems", []))
             epochs.append((chunk, ptg, date, ep))
@@ -321,7 +366,7 @@ def main():
             say(f"chunk {chunks.index(chunk) + 1}/{len(chunks)}  {chunk}")
             last_chunk = chunk
         eprob = []
-        ep = audit_epoch(os.path.join(root, key), ptg, want_size, args.expect_beams, eprob)
+        ep = audit_epoch(os.path.join(root, key), ptg, want_size, args.expect_beams, eprob, want_hdr)
         problems.extend(eprob)
         ep.update(problems=eprob, dir_mtime_ns=mt, sized=want_size,
                   audited_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
@@ -408,6 +453,73 @@ def main():
           f" {human(e['nbytes']) if want_size else '-':>10} {ro:>6} {'yes' if e['hdrlog'] else '-':>4}  {' '.join(e['flags'])}")
     w("")
 
+    # ---- header fix: truth from the stamps in the files, reasons from fix_pointing_v3 logs ----
+    hdr_state = {}
+    if want_hdr:
+        latest = {}                       # (epoch key, file) -> last logged status/detail
+        logdir = os.path.join(state, "hdrfix") if state else None
+        if logdir and os.path.isdir(logdir):
+            for lp in sorted(glob.glob(os.path.join(logdir, "*.csv"))):
+                try:
+                    with open(lp, newline="") as fh:
+                        for r in csv.DictReader(fh):
+                            latest[(r["epoch"], r["file"])] = (r["status"], r.get("detail", ""), r.get("run_utc", ""))
+                except (OSError, KeyError, csv.Error) as err:
+                    problems.append(f"BAD HDRFIX LOG {lp}: {err}")
+        last_run_by_epoch = {}
+        for (k, _), v in latest.items():
+            if v[2] > last_run_by_epoch.get(k, ""):
+                last_run_by_epoch[k] = v[2]
+        tot = Counter()
+        rows = []
+        for c, p, d, e in epochs:
+            key = f"{c}/{p}/{d}"
+            reasons = Counter()
+            for f in e["unstamped"]:
+                st, _, _ = latest.get((key, f), ("NEVER", "", ""))
+                reasons[st] += 1
+            last_run = last_run_by_epoch.get(key, "")
+            pos_ok = os.path.exists(os.path.join(args.posdir, f"{p}_{d}_pos.fits"))
+            if e["nfits"] and e["stamped"] == e["nfits"]:
+                stt = "DONE"
+            elif not pos_ok:
+                stt = "NOPOS"
+            elif any(r not in PERMANENT_FAIL for r in reasons):
+                stt = "TODO"
+            else:
+                stt = "STUCK"
+            hdr_state[key] = stt
+            tot[stt] += 1
+            tot["files"] += e["nfits"]; tot["stamped"] += e["stamped"]
+            for r, n in reasons.items():
+                tot["r_" + r] += n
+            rows.append((key, e, stt, reasons, last_run))
+        w("HEADER FIX  (fixed = PNTFIX stamp in the file; reasons for the rest from $CRAFTS_STATE_DIR/hdrfix/*.csv)")
+        w(f"  epochs: DONE {tot['DONE']}   TODO {tot['TODO']}   STUCK {tot['STUCK']}   NOPOS {tot['NOPOS']}   of {len(epochs)}")
+        w(f"  files : fixed {tot['stamped']} of {tot['files']}"
+          + (f" ({100 * tot['stamped'] / tot['files']:.1f}%)" if tot['files'] else ""))
+        nf = {k[2:]: v for k, v in tot.items() if k.startswith("r_")}
+        if nf:
+            w("  not fixed, by reason: " + "  ".join(f"{k}={v}" for k, v in sorted(nf.items(), key=lambda t: -t[1])))
+        w("    NEVER = no attempt logged; SKIP_DT = no pos sample within 1 s of start; NOROOM = header full, untouched;")
+        w("    ERROR/VERIFYFAIL are retried; SKIP_DT/NOROOM/NOCOL/NOBEAM/NOSTART/NOPOS need a person (epoch STUCK)")
+        w(f"  {'chunk/pointing/date':<52} {'state':<6} {'fixed':>11} {'v2':>5}  {'last fix run (UTC)':<19}  not fixed because")
+        for key, e, stt, reasons, last_run in rows:
+            why = " ".join(f"{k}={v}" for k, v in sorted(reasons.items(), key=lambda t: -t[1]))
+            w(f"  {key:<52} {stt:<6} {e['stamped']:>5}/{e['nfits']:<5} {e['v2only']:>5}  {last_run:<19}  {why}")
+        w("")
+        if state:
+            lists = {"DONE": "epochs_hdrfixed.txt", "TODO": "epochs_hdrfix_todo.txt",
+                     "STUCK": "epochs_hdrfix_stuck.txt", "NOPOS": "epochs_hdrfix_nopos.txt"}
+            for stt, fn in lists.items():
+                tmp = os.path.join(state, fn + ".tmp")
+                with open(tmp, "w") as fh:
+                    for key, *_ in [r for r in rows if r[2] == stt]:
+                        fh.write(os.path.join(root, key) + "\n")
+                os.replace(tmp, os.path.join(state, fn))
+            w(f"  lists (full epoch paths) in {state}: " + ", ".join(lists.values()))
+            w("")
+
     # what kinds of files we saw
     modes, tags = Counter(), Counter()
     for *_, e in epochs:
@@ -434,12 +546,13 @@ def main():
             f.write(text)
     if args.tsv:
         with open(args.tsv, "w") as f:
-            f.write("chunk\tpointing\tdate\tnfits\tnbeams\tmin_per_beam\tmax_per_beam\tbytes\treadonly\thdrlog\tnewest_mtime\tflags\n")
+            f.write("chunk\tpointing\tdate\tnfits\tnbeams\tmin_per_beam\tmax_per_beam\tbytes\treadonly\thdrlog\tnewest_mtime\thdr_state\tstamped\tflags\n")
             for c, p, d, e in epochs:
                 cnts = list(e["beams"].values()) or [0]
                 f.write(f"{c}\t{p}\t{d}\t{e['nfits']}\t{len(e['beams'])}\t{min(cnts)}\t{max(cnts)}\t"
                         f"{e['nbytes']}\t{e['nfits'] - e['writable'] if want_size else ''}\t{int(e['hdrlog'])}\t"
                         f"{time.strftime('%Y-%m-%dT%H:%M', time.localtime(e['newest'])) if e['newest'] else ''}\t"
+                        f"{hdr_state.get(f'{c}/{p}/{d}', '')}\t{e.get('stamped', '') if want_hdr else ''}\t"
                         f"{';'.join(e['flags'])}\n")
 
 
