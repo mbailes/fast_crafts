@@ -58,3 +58,32 @@ Re-runs only scan what changed. Each audited epoch is cached with its directory'
 Options: `--no-size` skips the per-file `stat` (faster, but no TB or permissions); `--expect-beams N` (default 19).
 Progress goes to stderr, the report to stdout (and `-o`). To keep a progress log too:
 `python3 tools/crafts_audit.py /aphid/temp/fast_crafts/data -o audit.txt --tsv audit_epochs.tsv 2> audit_progress.log`
+
+### `tools/fix_pointing_v3.py` — header (pointing) fix, with a stamp in every file
+
+Successor to the student's `update_pointing_v2.py`. It writes the same values: RA/DEC/RA_DEG/DEC_DEG
+from `<posdir>/<pointing>_<date>_pos.fits`, taking the sample nearest the file's start MJD for the
+file's beam, and rejecting it if more than 1 s away. On top of v2:
+
+- **Stamp:** every fixed file carries `PNTFIX` (tool + UTC), `PNTSRC`, `PNTMJD`, `PNTDT` and a `HISTORY` card.
+  A file with `PNTFIX` is fixed; a file without it is not.
+- **No whole-file rewrites:** only the primary header's own 2880-byte blocks are rewritten, in place,
+  and only if the new header fits. Otherwise the file is untouched and reported `NOROOM`.
+  (astropy `mode='update'` would rewrite the whole multi-GB file when a header grows.)
+- Re-reads and checks the header after writing (`VERIFYFAIL` otherwise).
+- **Idempotent:** stamped files are skipped (`ALREADY`); `--force` redoes them. Files fixed by v2 are
+  re-fixed and stamped, and the log records how far v2's position was from v3's (`shift_arcsec`).
+- **Per-file result log:** `$CRAFTS_STATE_DIR/hdrfix/<chunk>__<pointing>__<date>.csv`
+  with statuses `FIXED ALREADY SKIP_DT NOROOM NOPOS NOCOL NOBEAM NOSTART VERIFYFAIL ERROR`.
+- Warns if a beam's Dec is > 0.5 deg from the Dec in the pointing name.
+- Files are left read-only (0444), as before.
+
+```
+python3 tools/fix_pointing_v3.py --dry-run /aphid/temp/fast_crafts/data/ZD2021_1_1_2bit/Dec+3240_01_05/20220329
+python3 tools/fix_pointing_v3.py           /aphid/temp/fast_crafts/data/ZD2021_1_1_2bit/Dec+3240_01_05/20220329
+```
+
+`--posdir` (or `$CRAFTS_POSDIR`) sets where the `_pos.fits` files are; the default is the student's
+`/fred/oz002/users/vmandaog/pulsar_search/FAST/crafts_2bit_miaocc01`. Needs numpy + astropy.
+
+Batch: `slurm/fix_pointing_v3.slurm` runs one array task per epoch from a list (instructions in its header).
