@@ -11,12 +11,17 @@ It only lists directories and stats files (no file is opened or modified).
 Anything that does not fit the layout is reported, not skipped silently.
 
 Usage:
-  crafts_audit.py [ROOT] [-o REPORT.txt] [--tsv EPOCHS.tsv] [--no-size] [--expect-beams 19]
+  crafts_audit.py [ROOT] [--state-dir DIR] [-o REPORT.txt] [--tsv EPOCHS.tsv]
+                  [--no-size] [--full] [--no-cache] [--expect-beams 19]
 
   ROOT defaults to /aphid/temp/fast_crafts/data
+
+Re-runs are incremental: each finished epoch is cached with its directory mtime and
+skipped next time unless files were added/removed (or its header fix is mid-way).
 """
 
 import argparse
+import json
 import os
 import re
 import stat
@@ -28,6 +33,67 @@ FITS_RE = re.compile(
     r'^(?P<ptg>.+?)_(?P<mode>[A-Za-z]+)-M(?P<beam>\d{2})_(?P<seq>\d+)(?:_(?P<tag>[^.]+))?\.fits$')
 
 TB = 1e12
+CACHE_VERSION = 1
+
+
+# ---------------------------------------------------------------------------
+# Cache of finished epochs.  Raw-data epoch directories are never added to once
+# copied, so an epoch whose directory mtime is unchanged need not be re-scanned.
+# (Adding/removing/renaming a file always changes the directory's mtime.)
+# ---------------------------------------------------------------------------
+
+def ep_to_json(key, ep):
+    d = {k: v for k, v in ep.items() if k != "seqs"}
+    d["beams"] = {str(b): n for b, n in ep["beams"].items()}
+    d["modes"] = dict(ep["modes"])
+    d["tags"] = dict(ep["tags"])
+    d["key"] = key
+    d["v"] = CACHE_VERSION
+    return json.dumps(d, sort_keys=True)
+
+
+def ep_from_json(d):
+    d = dict(d)
+    d["beams"] = Counter({int(b): n for b, n in d["beams"].items()})
+    d["modes"] = Counter(d["modes"])
+    d["tags"] = Counter(d["tags"])
+    return d
+
+
+def load_cache(path):
+    cache = {}
+    if not path or not os.path.exists(path):
+        return cache
+    with open(path) as f:
+        for line in f:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue              # a torn last line from an interrupted write
+            if d.get("v") == CACHE_VERSION:
+                cache[d["key"]] = d
+    return cache
+
+
+def save_cache(path, cache):
+    """Atomic rewrite: write a temp file next to it, then rename over."""
+    if not path:
+        return
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        for d in cache.values():
+            f.write(json.dumps(d, sort_keys=True) + "\n")
+    os.replace(tmp, path)
+
+
+def cache_still_valid(d, dir_mtime_ns, want_size):
+    if d.get("dir_mtime_ns") != dir_mtime_ns:
+        return False                  # files added/removed since: re-audit
+    if want_size and not d.get("sized"):
+        return False                  # cached by a --no-size run
+    if want_size and d.get("hdrlog") and d["nfits"] - d["writable"] < d["nfits"]:
+        return False                  # header fix ran but chmod 444 may have happened since
+    return True
 
 
 def human(nbytes):
@@ -138,6 +204,8 @@ def audit_epoch(path, pointing, want_size, expect_beams, problems):
     if ep["ptg_mismatch"]:
         flags.append(f"PTGNAME≠DIR={ep['ptg_mismatch']}")
     ep["hdrlog"] = "update_pointing_logs" in ep["subdirs"]
+    if ep["hdrlog"] and want_size and ep["writable"]:
+        flags.append(f"HDRFIX-INCOMPLETE ro={ep['nfits'] - ep['writable']}/{ep['nfits']}")
     unknown = [d for d in ep["subdirs"] if d != "update_pointing_logs"]
     if unknown:
         flags.append("SUBDIRS=" + ",".join(unknown[:4]))
@@ -152,6 +220,14 @@ def main():
     ap.add_argument("--tsv", help="also write one machine-readable line per epoch")
     ap.add_argument("--no-size", action="store_true", help="skip stat() of every file (faster; no TB / perms)")
     ap.add_argument("--expect-beams", type=int, default=19)
+    ap.add_argument("--state-dir", default=os.environ.get("CRAFTS_STATE_DIR"),
+                    help="persistent (never-purged) directory for the report, tsv and cache; "
+                         "default $CRAFTS_STATE_DIR. With it set, -o/--tsv default to audit.txt/audit_epochs.tsv there")
+    ap.add_argument("--cache", default=None,
+                    help="cache of finished epochs (default: audit_cache.jsonl in the state dir, "
+                         "else next to ROOT)")
+    ap.add_argument("--full", action="store_true", help="ignore the cache and re-scan every epoch")
+    ap.add_argument("--no-cache", action="store_true", help="neither read nor write a cache")
     args = ap.parse_args()
 
     root = os.path.abspath(args.root)
@@ -166,6 +242,19 @@ def main():
         print(f"[{fmt_dur(time.time() - t_start):>8}] {msg}", file=sys.stderr, flush=True)
 
     say(f"audit of {root} started {started}")
+    state = args.state_dir
+    if state:
+        os.makedirs(state, exist_ok=True)
+        args.output = args.output or os.path.join(state, "audit.txt")
+        args.tsv = args.tsv or os.path.join(state, "audit_epochs.tsv")
+    cache_path = None if args.no_cache else (
+        args.cache or os.path.join(state or os.path.dirname(root), "audit_cache.jsonl"))
+    old = load_cache(cache_path) if cache_path else {}
+    cache = {} if args.full else dict(old)
+    if state:
+        say(f"state dir {state}  (report, tsv and cache are written here)")
+    if cache_path:
+        say(f"cache {cache_path}: {len(cache)} epochs loaded" + ("  (--full: ignoring them)" if args.full else ""))
 
     # ---- phase 1: directory skeleton only (fast: three levels of listings, no file stats) ----
     say("phase 1: listing chunk / pointing / date directories ...")
@@ -204,25 +293,66 @@ def main():
     say(f"phase 1 done in {fmt_dur(t_phase1)}")
 
     # ---- phase 2: census of every epoch, with running progress ----
-    say(f"phase 2: scanning {len(plan)} epochs" + ("" if want_size else " (--no-size: names only)") + " ...")
     t2 = time.time()
+    # Decide up front which epochs need scanning (one stat per epoch dir), so the ETA is honest.
+    todo, n_cached = [], 0
+    for chunk, ptg, date in plan:
+        key = f"{chunk}/{ptg}/{date}"
+        try:
+            mt = os.stat(os.path.join(root, key)).st_mtime_ns
+        except OSError as err:
+            problems.append(f"UNREADABLE  {os.path.join(root, key)}: {err}")
+            continue
+        d = cache.get(key)
+        if d is not None and cache_still_valid(d, mt, want_size):
+            ep = ep_from_json(d)
+            problems.extend(ep.get("problems", []))
+            epochs.append((chunk, ptg, date, ep))
+            n_cached += 1
+        else:
+            todo.append((chunk, ptg, date, key, mt, d is not None))
+    say(f"phase 2: {n_cached} epochs unchanged since last audit (from cache), {len(todo)} to scan"
+        + ("" if want_size else " (--no-size: names only)") + " ...")
     run_files = run_bytes = 0
     last_chunk = None
-    for i, (chunk, ptg, date) in enumerate(plan, 1):
+    since_save = 0
+    for i, (chunk, ptg, date, key, mt, was_cached) in enumerate(todo, 1):
         if chunk != last_chunk:
             say(f"chunk {chunks.index(chunk) + 1}/{len(chunks)}  {chunk}")
             last_chunk = chunk
-        ep = audit_epoch(os.path.join(root, chunk, ptg, date), ptg, want_size, args.expect_beams, problems)
+        eprob = []
+        ep = audit_epoch(os.path.join(root, key), ptg, want_size, args.expect_beams, eprob)
+        problems.extend(eprob)
+        ep.update(problems=eprob, dir_mtime_ns=mt, sized=want_size,
+                  audited_at=time.strftime('%Y-%m-%dT%H:%M:%S'))
         epochs.append((chunk, ptg, date, ep))
+        if cache_path:
+            cache[key] = json.loads(ep_to_json(key, ep))
+            since_save += 1
+            if since_save >= 50:
+                save_cache(cache_path, cache)
+                since_save = 0
         run_files += ep["nfits"]
         run_bytes += ep["nbytes"]
         el = time.time() - t2
-        eta = el / i * (len(plan) - i)
-        say(f"  {i:>5}/{len(plan)} {ptg}/{date}  {ep['nfits']:>5} files"
+        eta = el / i * (len(todo) - i)
+        say(f"  {i:>5}/{len(todo)} {ptg}/{date}  {ep['nfits']:>5} files"
             + (f" {human(ep['nbytes']):>10}" if want_size else "")
+            + ("  (changed)" if was_cached else "")
             + f" | total {run_files} files" + (f" {human(run_bytes)}" if want_size else "")
             + f", {run_files / el if el else 0:.0f} files/s, ETA {fmt_dur(eta)}"
             + (f"  !! {' '.join(ep['flags'])}" if ep["flags"] else ""))
+    if cache_path:
+        # keep entries for epochs no longer on disk (e.g. deleted after processing) - useful history
+        on_disk = {f"{c}/{p}/{d}" for c, p, d in plan}
+        for k, d in old.items():
+            cache.setdefault(k, d)
+        gone = [k for k in cache if k not in on_disk]
+        save_cache(cache_path, cache)
+        say(f"cache saved: {len(cache)} epochs ({len(gone)} no longer on disk)")
+    n_scanned = len(todo)
+    order = {k: n for n, k in enumerate(plan)}
+    epochs.sort(key=lambda t: order[(t[0], t[1], t[2])])
     t_phase2 = time.time() - t2
     t_total = time.time() - t_start
     say(f"phase 2 done in {fmt_dur(t_phase2)}; audit finished in {fmt_dur(t_total)}")
@@ -244,8 +374,10 @@ def main():
     w("")
     w("TIMING")
     w(f"  phase 1 (directory listing)  {fmt_dur(t_phase1):>10}")
+    scanned_files = sum(e["nfits"] for *_, e in epochs if "seqs" in e)
     w(f"  phase 2 (epoch census)       {fmt_dur(t_phase2):>10}"
-      + (f"   {tot_files / t_phase2:.0f} files/s" if t_phase2 > 0 else "")
+      + f"   {n_scanned} epochs scanned, {n_cached} from cache"
+      + (f", {scanned_files / t_phase2:.0f} files/s" if t_phase2 > 0 and n_scanned else "")
       + ("" if want_size else "   (--no-size)"))
     w(f"  total                        {fmt_dur(t_total):>10}")
     w("")
